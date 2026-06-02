@@ -1,0 +1,225 @@
+"""
+pipeline/staff_detector.py
+
+Ensemble Staff Detector for the Store Intelligence System.
+Why: Face blur prevents facial Re-ID. Uniform color hardcoding fails because staff 
+     may wear bright branded uniforms. A 4-signal ensemble (temporal persistence, 
+     zone transitions, calibrated torso color signature, and geometry) provides 
+     robustness. Day 1 fallback handles missing calibration data gracefully.
+"""
+
+import cv2
+import numpy as np
+from typing import Dict, Any, List, Tuple, Optional
+
+# Cosine similarity threshold for uniform signature matching
+# Why: 0.78 accounts for illumination shifts while preventing overlap with general shoppers.
+UNIFORM_SIM_THRESHOLD = 0.78
+
+# Minimum aspect ratio for vertical human stretching (staff near checkout/doors)
+# Why: 2.8 represents standing staff stretched vertically by camera perspective.
+GEOM_ASPECT_RATIO_MIN = 2.8
+
+# Maximum normalized Y coord for top quarter of frame
+# Why: 0.25 isolates background/cashier standing regions near wall boundaries.
+GEOM_Y_MAX = 0.25
+
+# Minimum clip visibility percentage for temporal persistence
+# Why: 0.55 ensures that employees who are stationary or on floor for >55% of frames are flagged.
+TEMPORAL_THRESHOLD = 0.55
+
+# Minimum zone visits to classify as floater staff
+# Why: Customers visit 2-3 zones max. 5 or more distinct transitions denotes staff.
+ZONE_TRANSITION_THRESHOLD = 5
+
+
+class StaffDetector:
+    """
+    4-Signal Ensemble Staff Detector.
+    Uses:
+      - Signal 1: Temporal persistence (>55% visible).
+      - Signal 2: Zone transition count (>=5 zones).
+      - Signal 3: Torso color signature similarity (>0.78).
+      - Signal 4: Geometry (aspect ratio > 2.8 and centroid_y < 0.25).
+    """
+
+    def __init__(self, total_frames: int = 1):
+        """
+        Initializes the staff detector.
+        total_frames: Total number of frames in the clip (used for persistence calculations).
+        """
+        self.total_frames = max(total_frames, 1)
+        self.calibrated_signature: Optional[np.ndarray] = None
+        self.calibration_histograms: List[np.ndarray] = []
+        self.is_calibrated = False
+
+    def calibrate_uniform(self) -> None:
+        """
+        Runs greedy leader clustering on collected torso histograms to determine 
+        the store's staff uniform signature.
+        Why: Pure NumPy clustering is fast, has zero external ML dependencies (no sklearn),
+             and isolates the most frequent appearance profile (store uniform).
+        """
+        if not self.calibration_histograms:
+            self.is_calibrated = False
+            return
+
+        # Simple greedy leader clustering
+        clusters: List[Tuple[np.ndarray, int]] = [] # list of (centroid, count)
+        
+        for hist in self.calibration_histograms:
+            if len(clusters) == 0:
+                clusters.append((hist, 1))
+                continue
+            
+            # Find best matching cluster centroid
+            best_sim = -1.0
+            best_idx = -1
+            for idx, (centroid, _) in enumerate(clusters):
+                # Cosine similarity
+                sim = np.dot(hist, centroid)
+                if sim > best_sim:
+                    best_sim = sim
+                    best_idx = idx
+            
+            # If similarity is high, merge into cluster and update centroid
+            # Why: 0.85 similarity threshold ensures tight cluster boundaries for identical uniforms.
+            if best_sim > 0.85:
+                centroid, count = clusters[best_idx]
+                new_count = count + 1
+                new_centroid = (centroid * count + hist) / new_count
+                # Normalize new centroid
+                norm = np.linalg.norm(new_centroid)
+                if norm > 0:
+                    new_centroid = new_centroid / norm
+                clusters[best_idx] = (new_centroid, new_count)
+            else:
+                clusters.append((hist, 1))
+
+        # Sort clusters by member count descending
+        clusters.sort(key=lambda x: x[1], reverse=True)
+
+        if clusters:
+            self.calibrated_signature = clusters[0][0]
+            self.is_calibrated = True
+            print(f"Staff uniform calibrated successfully. Captured {len(self.calibration_histograms)} samples. Top cluster size: {clusters[0][1]}.")
+        else:
+            self.is_calibrated = False
+
+    def collect_torso_sample(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> None:
+        """
+        Extracts torso region and stores normalized HSV color histogram for calibration.
+        bbox: (x1, y1, x2, y2) coordinates.
+        """
+        hist = self._compute_torso_histogram(frame, bbox)
+        if hist is not None:
+            self.calibration_histograms.append(hist)
+
+    def _compute_torso_histogram(self, frame: np.ndarray, bbox: Tuple[int, int, int, int]) -> Optional[np.ndarray]:
+        """
+        Extracts the middle vertical third of the bounding box (torso) and calculates HSV histogram.
+        Why: HSV is more invariant to lighting fluctuations than raw BGR/RGB space.
+        """
+        x1, y1, x2, y2 = bbox
+        h, w = frame.shape[:2]
+        
+        # Clip bounding box to frame boundaries
+        x1, y1 = max(0, x1), max(0, y1)
+        x2, y2 = min(w, x2), min(h, y2)
+        
+        box_w = x2 - x1
+        box_h = y2 - y1
+        if box_w <= 0 or box_h <= 10:
+            return None
+
+        # Torso boundaries: middle vertical third
+        torso_y1 = int(y1 + box_h / 3)
+        torso_y2 = int(y1 + 2 * box_h / 3)
+        
+        torso_crop = frame[torso_y1:torso_y2, x1:x2]
+        if torso_crop.size == 0:
+            return None
+
+        # Convert torso crop to HSV color space
+        hsv = cv2.cvtColor(torso_crop, cv2.COLOR_BGR2HSV)
+        
+        # Calculate 2D HSV histogram for H (Hue) and S (Saturation)
+        # Bins: 8 Hue bins, 8 Saturation bins to keep signature vector small (64-dim) and robust
+        hist = cv2.calcHist([hsv], [0, 1], None, [8, 8], [0, 180, 0, 256])
+        
+        # Normalize histogram to unit norm
+        norm = np.linalg.norm(hist)
+        if norm > 0:
+            hist = hist / norm
+        else:
+            return None
+            
+        return hist.flatten()
+
+    def evaluate_track(
+        self, 
+        frame: np.ndarray, 
+        bbox: Tuple[int, int, int, int], 
+        visible_frames: int, 
+        zones_visited: List[str]
+    ) -> Tuple[bool, float]:
+        """
+        Evaluates a track using the 4-signal ensemble voting rule.
+        Returns: (is_staff: bool, confidence: float)
+        Why: 2 or more signals voting True flags is_staff=True.
+             Gracefully handles uncalibrated status by omitting Signal 3.
+        """
+        votes = 0
+        total_signals = 4 if self.is_calibrated else 3
+        confidence_accum = 0.0
+
+        # Signal 1: Temporal Persistence
+        ratio_visible = visible_frames / self.total_frames
+        s1_vote = ratio_visible > TEMPORAL_THRESHOLD
+        if s1_vote:
+            votes += 1
+            confidence_accum += min(ratio_visible, 1.0)
+            
+        # Signal 2: Zone Transition Count
+        unique_zones = len(set(zones_visited))
+        s2_vote = unique_zones >= ZONE_TRANSITION_THRESHOLD
+        if s2_vote:
+            votes += 1
+            confidence_accum += min(unique_zones / 6.0, 1.0)
+
+        # Signal 3: Uniform Color Similarity (Inference phase)
+        s3_vote = False
+        if self.is_calibrated and self.calibrated_signature is not None:
+            hist = self._compute_torso_histogram(frame, bbox)
+            if hist is not None:
+                # Cosine similarity
+                sim = np.dot(hist, self.calibrated_signature)
+                s3_vote = sim > UNIFORM_SIM_THRESHOLD
+                if s3_vote:
+                    votes += 1
+                    confidence_accum += sim
+
+        # Signal 4: Geometry Heuristic
+        x1, y1, x2, y2 = bbox
+        box_w = max(1, x2 - x1)
+        box_h = max(1, y2 - y1)
+        aspect_ratio = box_h / box_w
+        
+        f_h, f_w = frame.shape[:2]
+        centroid_y = (y1 + y2) / 2.0 / f_h
+        
+        s4_vote = aspect_ratio > GEOM_ASPECT_RATIO_MIN and centroid_y < GEOM_Y_MAX
+        if s4_vote:
+            votes += 1
+            confidence_accum += 0.8  # Fixed confidence boost for geometrical match
+
+        # Voting rule: 2 or more signals = is_staff = True
+        is_staff = votes >= 2
+        
+        # Compute confidence score based on voter fraction and matching strengths
+        if votes > 0:
+            confidence = min(1.0, (confidence_accum / votes) * (votes / total_signals))
+        else:
+            confidence = 0.0
+
+        return is_staff, float(confidence)
